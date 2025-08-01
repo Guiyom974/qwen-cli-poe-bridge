@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import StreamingResponse
 import fastapi_poe as fp
 from pydantic import BaseModel, Field
-from typing import List, Dict, Optional, AsyncGenerator
+from typing import List, Dict, Optional, Any
 
 # --- CONFIGURATION ---
 DEFAULT_POE_MODEL = "Qwen-3-235B-0527-T"
@@ -16,16 +16,38 @@ POE_API_KEY = os.environ.get("POE_CALLER_API_KEY1")
 MODAL_AUTH_TOKEN = os.environ.get("MODAL_AUTH_TOKEN")
 
 # --- OPENAI-COMPATIBLE DATA MODELS ---
+# We need to expand these to fully support tool calls.
 
-# For Non-Streaming Responses
 class OpenAIMessage(BaseModel):
     role: str
-    content: str
+    content: Optional[str] = None
+    tool_calls: Optional[List[Dict]] = None
+
+class OpenAIChatRequest(BaseModel):
+    model: str
+    messages: List[OpenAIMessage]
+    tools: Optional[List[Dict]] = None  # <-- NEW: To receive tool definitions
+    tool_choice: Optional[Any] = None
+    stream: Optional[bool] = False
+
+class FunctionCall(BaseModel):
+    name: str
+    arguments: str
+
+class ToolCall(BaseModel):
+    id: str = Field(default_factory=lambda: "call_" + os.urandom(8).hex())
+    type: str = "function"
+    function: FunctionCall
+
+class AssistantMessage(BaseModel):
+    role: str = "assistant"
+    content: Optional[str] = None
+    tool_calls: Optional[List[ToolCall]] = None
 
 class ChatCompletionChoice(BaseModel):
     index: int = 0
-    message: OpenAIMessage
-    finish_reason: str = "stop"
+    message: AssistantMessage
+    finish_reason: str = "tool_calls" # Default to tool_calls if tools are used
 
 class OpenAIChatResponse(BaseModel):
     id: str = Field(default_factory=lambda: "chatcmpl-" + os.urandom(12).hex())
@@ -34,66 +56,35 @@ class OpenAIChatResponse(BaseModel):
     model: str
     choices: List[ChatCompletionChoice]
 
-# For Streaming Responses
-class DeltaMessage(BaseModel):
-    role: Optional[str] = None
-    content: Optional[str] = None
+# --- NEW: Tool Handling Logic ---
 
-class StreamingChoice(BaseModel):
-    index: int = 0
-    delta: DeltaMessage
-    finish_reason: Optional[str] = None
-
-class OpenAIStreamingResponse(BaseModel):
-    id: str = Field(default_factory=lambda: "chatcmpl-" + os.urandom(12).hex())
-    object: str = "chat.completion.chunk"
-    created: int = Field(default_factory=lambda: int(time.time()))
-    model: str
-    choices: List[StreamingChoice]
-
-# --- Main Request Body ---
-class OpenAIChatRequest(BaseModel):
-    model: str
-    messages: List[OpenAIMessage]
-    stream: Optional[bool] = False
-
-# --- STREAMING LOGIC ---
-async def stream_poe_to_openai_format(
-    poe_model: str, user_prompt: str
-) -> AsyncGenerator[str, None]:
-    """
-    This generator function streams the response from Poe and formats each chunk
-    into the OpenAI Server-Sent Event (SSE) format.
-    """
-    # First, send a chunk to establish the role
-    delta_role = DeltaMessage(role="assistant", content="")
-    choice_role = StreamingChoice(delta=delta_role)
-    stream_chunk_role = OpenAIStreamingResponse(model=poe_model, choices=[choice_role])
-    yield f"data: {stream_chunk_role.model_dump_json()}\n\n"
-
-    # Stream the actual content from Poe
-    poe_messages = [fp.ProtocolMessage(role="user", content=user_prompt)]
-    full_response_text = ""
-    async for partial in fp.get_bot_response(
-        messages=poe_messages, bot_name=poe_model, api_key=POE_API_KEY
-    ):
-        # According to the docs, partial.text contains the *next token*, not the full text.
-        if partial.text:
-            # CORRECTED LINE: Use partial.text instead of partial.text_new
-            delta = DeltaMessage(content=partial.text)
-            choice = StreamingChoice(delta=delta)
-            stream_chunk = OpenAIStreamingResponse(model=poe_model, choices=[choice])
-            yield f"data: {stream_chunk.model_dump_json()}\n\n"
+def format_tools_for_prompt(tools: List[Dict]) -> str:
+    """Converts the OpenAI tool list into a text-based format for the Poe prompt."""
+    if not tools:
+        return ""
     
-    # Send the final termination chunk
-    delta_stop = DeltaMessage()
-    choice_stop = StreamingChoice(delta=delta_stop, finish_reason="stop")
-    stream_chunk_stop = OpenAIStreamingResponse(model=poe_model, choices=[choice_stop])
-    yield f"data: {stream_chunk_stop.model_dump_json()}\n\n"
-    yield "data: [DONE]\n\n"
+    formatted_string = "You have access to the following tools. Use them when necessary to answer the user's request.\n\n<TOOLS>\n"
+    # The Qwen documentation shows the tools are in a 'function' sub-dict
+    for tool in tools:
+        if tool.get("type") == "function" and "function" in tool:
+            func = tool["function"]
+            name = func.get("name")
+            description = func.get("description")
+            parameters = func.get("parameters")
+            
+            formatted_string += f"- Tool: `{name}`\n"
+            formatted_string += f"  Description: {description}\n"
+            formatted_string += f"  Parameters (JSON Schema): {json.dumps(parameters)}\n\n"
+            
+    formatted_string += "</TOOLS>\n\n"
+    formatted_string += "To use a tool, you MUST respond with ONLY a JSON object containing a 'tool_calls' list. Do not add any other text. Example format:\n"
+    formatted_string += """
+    {"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg_name\\": \\"arg_value\\"}"}}]}
+    """
+    return formatted_string
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Poe to OpenAI-Format Bridge")
+app = FastAPI(title="Poe to OpenAI-Format Bridge with Tool Support")
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: OpenAIChatRequest, authorization: Optional[str] = Header(None)):
@@ -106,40 +97,61 @@ async def chat_completions(request: OpenAIChatRequest, authorization: Optional[s
     if token != MODAL_AUTH_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid API Key.")
 
-    # (Prompt and model selection logic remains the same)
+    # --- UPDATED: Construct the full prompt with tool instructions ---
     if not request.messages:
         raise HTTPException(status_code=400, detail="No messages provided.")
-    user_prompt = request.messages[-1].content
+    
+    # We combine the conversation history and the latest prompt
+    full_conversation_prompt = "\n".join([f"{msg.role}: {msg.content}" for msg in request.messages])
+
+    # Format the tools and create the final instruction prompt
+    tool_instructions = format_tools_for_prompt(request.tools)
+    final_prompt = f"{tool_instructions}\n\nHere is the conversation history and the user's latest request:\n\n{full_conversation_prompt}\n\nAssistant:"
+
+    # (Model selection logic remains the same)
     selected_model = DEFAULT_POE_MODEL
-    model_match = re.match(r"^\s*#@([\w.-]+)\s*", user_prompt)
+    model_match = re.match(r"^\s*#@([\w.-]+)\s*", request.messages[-1].content or "")
     if model_match:
         selected_model = model_match.group(1)
-        user_prompt = user_prompt[model_match.end():]
+        print(f"Poe Model Override: {selected_model}")
 
-    # --- UPDATED: Handle Streaming vs. Non-Streaming ---
-    if request.stream:
-        # If the client requests a stream, return a StreamingResponse.
-        return StreamingResponse(
-            stream_poe_to_openai_format(selected_model, user_prompt),
-            media_type="text/event-stream",
-        )
-    else:
-        # Otherwise, use the original non-streaming logic.
-        try:
-            poe_messages = [fp.ProtocolMessage(role="user", content=user_prompt)]
-            final_text = ""
-            async for partial in fp.get_bot_response(messages=poe_messages, bot_name=selected_model, api_key=POE_API_KEY):
-                # For non-streaming, we must concatenate the chunks.
-                final_text += partial.text
-            
-            response_message = OpenAIMessage(role="assistant", content=final_text)
-            choice = ChatCompletionChoice(message=response_message)
-            return OpenAIChatResponse(model=selected_model, choices=[choice])
-        except Exception as e:
-            error_message = f"Error from Poe API: {str(e)}"
-            response_message = OpenAIMessage(role="assistant", content=error_message)
-            choice = ChatCompletionChoice(message=response_message)
-            return OpenAIChatResponse(model=selected_model, choices=[choice])
+    # --- Call Poe and Parse the Response ---
+    try:
+        poe_messages = [fp.ProtocolMessage(role="user", content=final_prompt)]
+        final_text = ""
+        async for partial in fp.get_bot_response(messages=poe_messages, bot_name=selected_model, api_key=POE_API_KEY):
+            final_text += partial.text
+
+        # --- UPDATED: Check if the response is a tool call or regular text ---
+        final_text = final_text.strip()
+        response_message = None
+        finish_reason = "stop"
+
+        if final_text.startswith("{") and final_text.endswith("}"):
+            try:
+                # It's likely a JSON object for a tool call
+                parsed_json = json.loads(final_text)
+                if "tool_calls" in parsed_json:
+                    # Success! The model wants to call a tool.
+                    response_message = AssistantMessage(tool_calls=parsed_json["tool_calls"])
+                    finish_reason = "tool_calls"
+            except json.JSONDecodeError:
+                # It looked like JSON but wasn't valid, treat as text
+                pass
+        
+        if response_message is None:
+            # It's a regular text response
+            response_message = AssistantMessage(content=final_text)
+            finish_reason = "stop"
+
+        choice = ChatCompletionChoice(message=response_message, finish_reason=finish_reason)
+        return OpenAIChatResponse(model=selected_model, choices=[choice])
+
+    except Exception as e:
+        error_message = f"Error from Poe API: {str(e)}"
+        response_message = AssistantMessage(content=error_message)
+        choice = ChatCompletionChoice(message=response_message, finish_reason="stop")
+        return OpenAIChatResponse(model=selected_model, choices=[choice])
 
 # --- MODAL APP SETUP ---
 app_modal = modal.App("poe-qwen-bridge-openai-format")
