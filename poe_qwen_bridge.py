@@ -15,18 +15,35 @@ DEFAULT_POE_MODEL = "Qwen-3-235B-0527-T"
 POE_API_KEY = os.environ.get("POE_CALLER_API_KEY1")
 MODAL_AUTH_TOKEN = os.environ.get("MODAL_AUTH_TOKEN")
 
-# --- OPENAI-COMPATIBLE DATA MODELS ---
-# We need to expand these to fully support tool calls.
+# --- NEW: THE MASTER AGENT SYSTEM PROMPT ---
+# This prompt gives the Poe bot its core identity and instructions.
+AGENT_SYSTEM_PROMPT = """
+You are an expert AI pair programmer acting as a command-line agent within a user's development environment (like VS Code's terminal). Your primary goal is to help the user with their code by reading, writing, and editing files, and running commands.
 
+**Golden Rule: How to Use Tools**
+When you decide to use a tool, you MUST respond with ONLY a valid JSON object containing a "tool_calls" list. Do not add any other text, explanations, or markdown formatting around the JSON.
+
+Correct Tool Use Example:
+{"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "edit_file", "arguments": "{\\"file_path\\": \\"src/main.py\\", \\"content\\": \\"print('Hello, World!')\\"}"}}]}
+
+**Behavioral Guidelines:**
+1.  **Think Step-by-Step:** Before acting, consider the user's request. If you need to read a file first to understand the context before editing it, plan to call the `read_file` tool first.
+2.  **Ask for Clarification:** If a request is ambiguous (e.g., "fix my code"), ask for more information (e.g., "Which file has the bug? Can you describe the error?").
+3.  **Standard Chat:** If you are just answering a question, providing an explanation, or writing a code snippet without using a tool, respond in plain Markdown as a standard chatbot. Do NOT use the JSON tool format for this.
+"""
+
+# --- OPENAI-COMPATIBLE DATA MODELS ---
+# (These are expanded to fully support tool calls)
 class OpenAIMessage(BaseModel):
     role: str
     content: Optional[str] = None
     tool_calls: Optional[List[Dict]] = None
+    tool_call_id: Optional[str] = None
 
 class OpenAIChatRequest(BaseModel):
     model: str
     messages: List[OpenAIMessage]
-    tools: Optional[List[Dict]] = None  # <-- NEW: To receive tool definitions
+    tools: Optional[List[Dict]] = None
     tool_choice: Optional[Any] = None
     stream: Optional[bool] = False
 
@@ -47,7 +64,7 @@ class AssistantMessage(BaseModel):
 class ChatCompletionChoice(BaseModel):
     index: int = 0
     message: AssistantMessage
-    finish_reason: str = "tool_calls" # Default to tool_calls if tools are used
+    finish_reason: str
 
 class OpenAIChatResponse(BaseModel):
     id: str = Field(default_factory=lambda: "chatcmpl-" + os.urandom(12).hex())
@@ -56,35 +73,24 @@ class OpenAIChatResponse(BaseModel):
     model: str
     choices: List[ChatCompletionChoice]
 
-# --- NEW: Tool Handling Logic ---
-
-def format_tools_for_prompt(tools: List[Dict]) -> str:
-    """Converts the OpenAI tool list into a text-based format for the Poe prompt."""
+# --- Tool Formatting Helper ---
+def format_tools_for_prompt(tools: Optional[List[Dict]]) -> str:
+    """Converts the OpenAI tool list into a simple text manifest for the prompt."""
     if not tools:
-        return ""
+        return "No tools are available for this request."
     
-    formatted_string = "You have access to the following tools. Use them when necessary to answer the user's request.\n\n<TOOLS>\n"
-    # The Qwen documentation shows the tools are in a 'function' sub-dict
+    formatted_string = "## Available Tools for This Request\n"
     for tool in tools:
         if tool.get("type") == "function" and "function" in tool:
             func = tool["function"]
             name = func.get("name")
             description = func.get("description")
-            parameters = func.get("parameters")
-            
-            formatted_string += f"- Tool: `{name}`\n"
-            formatted_string += f"  Description: {description}\n"
-            formatted_string += f"  Parameters (JSON Schema): {json.dumps(parameters)}\n\n"
-            
-    formatted_string += "</TOOLS>\n\n"
-    formatted_string += "To use a tool, you MUST respond with ONLY a JSON object containing a 'tool_calls' list. Do not add any other text. Example format:\n"
-    formatted_string += """
-    {"tool_calls": [{"id": "call_abc123", "type": "function", "function": {"name": "tool_name", "arguments": "{\\"arg_name\\": \\"arg_value\\"}"}}]}
-    """
+            parameters = json.dumps(func.get("parameters", {}))
+            formatted_string += f"- **{name}**: {description}\n  - Parameters: `{parameters}`\n"
     return formatted_string
 
 # --- FASTAPI APP ---
-app = FastAPI(title="Poe to OpenAI-Format Bridge with Tool Support")
+app = FastAPI(title="Poe to Qwen-Code Agent Bridge")
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: OpenAIChatRequest, authorization: Optional[str] = Header(None)):
@@ -97,50 +103,55 @@ async def chat_completions(request: OpenAIChatRequest, authorization: Optional[s
     if token != MODAL_AUTH_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid API Key.")
 
-    # --- UPDATED: Construct the full prompt with tool instructions ---
+    # --- Construct the Full Agentic Prompt ---
     if not request.messages:
         raise HTTPException(status_code=400, detail="No messages provided.")
     
-    # We combine the conversation history and the latest prompt
-    full_conversation_prompt = "\n".join([f"{msg.role}: {msg.content}" for msg in request.messages])
-
-    # Format the tools and create the final instruction prompt
-    tool_instructions = format_tools_for_prompt(request.tools)
-    final_prompt = f"{tool_instructions}\n\nHere is the conversation history and the user's latest request:\n\n{full_conversation_prompt}\n\nAssistant:"
+    # Format the conversation history into a simple string
+    conversation_history = "\n".join([f"**{msg.role}**: {msg.content or ''}" for msg in request.messages])
+    
+    # Get the dynamic list of tools for this specific request
+    dynamic_tool_list = format_tools_for_prompt(request.tools)
+    
+    # Combine everything into the final prompt for Poe
+    final_prompt_to_poe = (
+        f"{AGENT_SYSTEM_PROMPT}\n\n"
+        f"{dynamic_tool_list}\n\n"
+        f"--- CONVERSATION HISTORY & CURRENT REQUEST ---\n"
+        f"{conversation_history}\n\n"
+        f"**assistant**:"
+    )
 
     # (Model selection logic remains the same)
     selected_model = DEFAULT_POE_MODEL
     model_match = re.match(r"^\s*#@([\w.-]+)\s*", request.messages[-1].content or "")
     if model_match:
         selected_model = model_match.group(1)
-        print(f"Poe Model Override: {selected_model}")
 
     # --- Call Poe and Parse the Response ---
     try:
-        poe_messages = [fp.ProtocolMessage(role="user", content=final_prompt)]
+        poe_messages = [fp.ProtocolMessage(role="user", content=final_prompt_to_poe)]
         final_text = ""
+        # Non-streaming is better for parsing tool calls vs. text
         async for partial in fp.get_bot_response(messages=poe_messages, bot_name=selected_model, api_key=POE_API_KEY):
             final_text += partial.text
 
-        # --- UPDATED: Check if the response is a tool call or regular text ---
         final_text = final_text.strip()
         response_message = None
         finish_reason = "stop"
 
+        # Check if the model wants to call a tool
         if final_text.startswith("{") and final_text.endswith("}"):
             try:
-                # It's likely a JSON object for a tool call
                 parsed_json = json.loads(final_text)
                 if "tool_calls" in parsed_json:
-                    # Success! The model wants to call a tool.
                     response_message = AssistantMessage(tool_calls=parsed_json["tool_calls"])
                     finish_reason = "tool_calls"
             except json.JSONDecodeError:
-                # It looked like JSON but wasn't valid, treat as text
-                pass
-        
+                pass  # It wasn't valid JSON, so treat as text
+
+        # If it's not a tool call, treat it as a standard text response
         if response_message is None:
-            # It's a regular text response
             response_message = AssistantMessage(content=final_text)
             finish_reason = "stop"
 
@@ -148,13 +159,14 @@ async def chat_completions(request: OpenAIChatRequest, authorization: Optional[s
         return OpenAIChatResponse(model=selected_model, choices=[choice])
 
     except Exception as e:
+        # Handle errors gracefully
         error_message = f"Error from Poe API: {str(e)}"
         response_message = AssistantMessage(content=error_message)
         choice = ChatCompletionChoice(message=response_message, finish_reason="stop")
         return OpenAIChatResponse(model=selected_model, choices=[choice])
 
 # --- MODAL APP SETUP ---
-app_modal = modal.App("poe-qwen-bridge-openai-format")
+app_modal = modal.App("poe-qwen-bridge-agent")
 
 image = (
     modal.Image.debian_slim()
